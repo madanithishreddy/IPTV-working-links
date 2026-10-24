@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urljoin
 
 import aiohttp
 
@@ -95,22 +96,71 @@ async def fetch_source(session: aiohttp.ClientSession) -> str:
 
 
 async def is_live(session: aiohttp.ClientSession, url: str) -> bool:
-    """Use HEAD first, then a minimal GET for servers that block HEAD."""
+    """Check HTTP streams and validate HLS manifests and their first segment."""
+    async def validate_get() -> bool:
+        try:
+            async with session.get(url, allow_redirects=True) as response:
+                if response.status != 200:
+                    return False
+                body = await response.content.read(131072)
+                text = body.decode("utf-8", errors="replace")
+                if "#EXTM3U" not in text:
+                    return bool(body)
+
+                media_url = next(
+                    (
+                        line.strip()
+                        for line in text.splitlines()
+                        if line.strip() and not line.startswith("#")
+                    ),
+                    None,
+                )
+                if not media_url:
+                    return False
+
+                # A master playlist points to a media playlist; validate both.
+                if "#EXT-X-STREAM-INF" in text:
+                    media_url = urljoin(str(response.url), media_url)
+                    async with session.get(
+                        media_url, allow_redirects=True
+                    ) as media_response:
+                        if media_response.status != 200:
+                            return False
+                        media_text = (
+                            await media_response.content.read(131072)
+                        ).decode("utf-8", errors="replace")
+                else:
+                    media_url = str(response.url)
+                    media_text = text
+
+                segment_url = next(
+                    (
+                        line.strip()
+                        for line in media_text.splitlines()
+                        if line.strip() and not line.startswith("#")
+                    ),
+                    None,
+                )
+                if not segment_url:
+                    return False
+
+                async with session.get(
+                    urljoin(media_url, segment_url), allow_redirects=True
+                ) as segment_response:
+                    if segment_response.status != 200:
+                        return False
+                    return bool(await segment_response.content.read(1))
+        except (aiohttp.ClientError, asyncio.TimeoutError, UnicodeError):
+            return False
+
     try:
         async with session.head(url, allow_redirects=True) as response:
             if response.status == 200:
-                return True
+                return await validate_get()
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass
 
-    try:
-        async with session.get(url, allow_redirects=True) as response:
-            if response.status != 200:
-                return False
-            await response.content.read(1)
-            return True
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        return False
+    return await validate_get()
 
 
 async def check_channels(channels: Iterable[Channel]) -> list[Channel]:
